@@ -335,14 +335,15 @@ export function computeCorrectedHours(
 // ─────────────────────────────────────────────────────────────────────────────
 // Hour type breakdown — normal / extra 50% / extra 100% / nocturnas
 //
-// Rules (confirmed with client, since Humand community has no hour categories
-// configured):
-//  - Normal: worked hours up to the day's scheduled hours (non-night portion).
-//    If the day has no schedule at all, everything is "normal" (no extras are
-//    inferred) — flag for manual payroll review.
-//  - Extra 50%: hours beyond scheduled, on a weekday or Saturday before 13:00.
-//  - Extra 100%: hours beyond scheduled, on Saturday from 13:00, Sunday, or a
-//    holiday.
+// Rules (confirmed with client, 2026-09-11 correction from Paula Ferro):
+//  - Normal: hours worked within the day's scheduled window (start–end of the
+//    day's time slots). If the day has no schedule at all, everything worked
+//    is "normal" (no extras are inferred) — flag for manual payroll review.
+//  - Extra 50%: hours worked on a weekday (Mon–Fri) outside the scheduled
+//    window, up to 21:00 (hours from 21:00 on are pulled into "nocturnas").
+//  - Extra 100%: hours worked on a Saturday beyond the first 5 hours worked
+//    that day (cumulative, regardless of schedule/time of day), OR any hour
+//    worked on a Sunday or holiday (the whole day, regardless of schedule).
 //  - Nocturnas: hours worked between 21:00 and 06:00 are pulled out of the
 //    normal/extra buckets entirely and counted only as night hours.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,12 +357,13 @@ export interface HourBreakdown {
 
 const NIGHT_START = '21:00'
 const NIGHT_END = '06:00'
-const SATURDAY_100_FROM = '13:00'
+const SATURDAY_100_AFTER_MS = 5 * 3_600_000
 
 export function computeHourBreakdown(
   intervalStartMs: number | null,
   intervalEndMs: number | null,
-  scheduledHours: number,
+  scheduledStart: string | null,
+  scheduledEnd: string | null,
   hasSchedule: boolean,
   referenceDate: string,
   isHoliday: boolean
@@ -377,26 +379,31 @@ export function computeHourBreakdown(
     return { start: toBADateTime(d, NIGHT_START), end: toBADateTime(nd, NIGHT_END) }
   })
 
-  // Breakpoints: night window edges + Saturday 13:00 boundary, clipped to the interval.
+  // Scheduled window for referenceDate (used to tell "normal" from "extra" on
+  // weekdays). Handles an overnight schedule (end time before start time).
+  let winStartMs: number | null = null
+  let winEndMs: number | null = null
+  if (hasSchedule && scheduledStart && scheduledEnd) {
+    winStartMs = toBADateTime(referenceDate, scheduledStart)
+    winEndMs = toBADateTime(referenceDate, scheduledEnd)
+    if (winEndMs <= winStartMs) winEndMs += 24 * 3_600_000
+  }
+
+  // Breakpoints: night window edges + scheduled window edges, clipped to the interval.
   const breakpoints = new Set<number>([intervalStartMs, intervalEndMs])
   for (const w of nightWindows) {
     if (w.start > intervalStartMs && w.start < intervalEndMs) breakpoints.add(w.start)
     if (w.end > intervalStartMs && w.end < intervalEndMs) breakpoints.add(w.end)
   }
-  for (const n of [-1, 0, 1]) {
-    const d = addDaysToDateStr(referenceDate, n)
-    if (weekdayOf(d) === 'SATURDAY') {
-      const sat13 = toBADateTime(d, SATURDAY_100_FROM)
-      if (sat13 > intervalStartMs && sat13 < intervalEndMs) breakpoints.add(sat13)
-    }
+  if (winStartMs !== null && winEndMs !== null) {
+    if (winStartMs > intervalStartMs && winStartMs < intervalEndMs) breakpoints.add(winStartMs)
+    if (winEndMs > intervalStartMs && winEndMs < intervalEndMs) breakpoints.add(winEndMs)
   }
 
   const points = [...breakpoints].sort((a, b) => a - b)
 
-  // No schedule that day → don't infer extras, everything worked is "normal".
-  const scheduledMs = hasSchedule ? Math.max(0, scheduledHours) * 3_600_000 : Infinity
-  let consumedNonNightMs = 0
   let normalMs = 0, extra50Ms = 0, extra100Ms = 0, nightMs = 0
+  let consumedSaturdayMs = 0 // cumulative non-night Saturday hours worked, across segments
 
   for (let i = 0; i < points.length - 1; i++) {
     const segStart = points[i]
@@ -414,21 +421,35 @@ export function computeHourBreakdown(
     const baMid = new Date(mid - 3 * 3_600_000)
     const segDate = baMid.toISOString().split('T')[0]
     const segWeekday = weekdayOf(segDate)
-    const segHour = baMid.getUTCHours() + baMid.getUTCMinutes() / 60
-    const is100 = isHoliday || segWeekday === 'SUNDAY' || (segWeekday === 'SATURDAY' && segHour >= 13)
 
-    const remainingQuota = scheduledMs - consumedNonNightMs
-    if (remainingQuota <= 0) {
-      if (is100) extra100Ms += dur; else extra50Ms += dur
-    } else if (dur <= remainingQuota) {
-      normalMs += dur
-      consumedNonNightMs += dur
-    } else {
-      normalMs += remainingQuota
-      const extraDur = dur - remainingQuota
-      if (is100) extra100Ms += extraDur; else extra50Ms += extraDur
-      consumedNonNightMs += remainingQuota
+    if (isHoliday || segWeekday === 'SUNDAY') {
+      extra100Ms += dur
+      continue
     }
+
+    if (segWeekday === 'SATURDAY') {
+      const remaining = SATURDAY_100_AFTER_MS - consumedSaturdayMs
+      if (remaining <= 0) {
+        extra100Ms += dur
+      } else if (dur <= remaining) {
+        normalMs += dur
+        consumedSaturdayMs += dur
+      } else {
+        normalMs += remaining
+        extra100Ms += dur - remaining
+        consumedSaturdayMs += remaining
+      }
+      continue
+    }
+
+    // Weekday (Mon–Fri).
+    if (winStartMs === null || winEndMs === null) {
+      // No schedule → don't infer extras, everything worked is "normal".
+      normalMs += dur
+      continue
+    }
+    const inWindow = segDate === referenceDate && mid >= winStartMs && mid < winEndMs
+    if (inWindow) normalMs += dur; else extra50Ms += dur
   }
 
   return {
@@ -533,7 +554,7 @@ export function buildMatrixData(
       }, 0)
 
       const { normalHours, extra50Hours, extra100Hours, nightHours } = computeHourBreakdown(
-        intervalStartMs, intervalEndMs, scheduledHours, summary.hasSchedule, date,
+        intervalStartMs, intervalEndMs, scheduledStart, scheduledEnd, summary.hasSchedule, date,
         summary.holidays.length > 0
       )
 

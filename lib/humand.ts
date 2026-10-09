@@ -188,6 +188,15 @@ function weekdayOf(date: string): string {
 // Hours calculation — mirrors Redash SQL logic + improvements for edge cases
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface SessionInterval {
+  startMs: number
+  endMs: number
+}
+
+function sumIntervalsHours(intervals: SessionInterval[]): number {
+  return intervals.reduce((sum, iv) => sum + Math.max(0, iv.endMs - iv.startMs), 0) / 3_600_000
+}
+
 export function computeCorrectedHours(
   entries: HumandEntry[],
   timeSlots: HumandTimeSlot[] | null,
@@ -197,12 +206,11 @@ export function computeCorrectedHours(
   isAutoClose: boolean
   isEnCurso: boolean
   session1IsCarryover: boolean
-  intervalStartMs: number | null
-  intervalEndMs: number | null
+  intervals: SessionInterval[]
 } {
   const NO = {
     correctedHours: null, isAutoClose: false, isEnCurso: false, session1IsCarryover: false,
-    intervalStartMs: null, intervalEndMs: null,
+    intervals: [] as SessionInterval[],
   }
   if (entries.length === 0) return NO
 
@@ -236,28 +244,30 @@ export function computeCorrectedHours(
     const realStartMs = new Date(entrada2!.time).getTime()
     if (salida2 !== null) {
       const endMs = new Date(salida2.time).getTime()
+      const intervals = [{ startMs: realStartMs, endMs }]
       return {
-        correctedHours: Math.max(0, (endMs - realStartMs) / 3_600_000),
+        correctedHours: sumIntervalsHours(intervals),
         isAutoClose: !isReal(salida2.source),
         isEnCurso: false,
         session1IsCarryover: true,
-        intervalStartMs: realStartMs, intervalEndMs: endMs,
+        intervals,
       }
     }
     // Session 2 is open → en curso, estimate to scheduled end
     if (progEndTime) {
       const endMs = toBADateTime(referenceDate, progEndTime)
+      const intervals = [{ startMs: realStartMs, endMs }]
       return {
-        correctedHours: Math.max(0, (endMs - realStartMs) / 3_600_000),
+        correctedHours: sumIntervalsHours(intervals),
         isAutoClose: true,
         isEnCurso: true,
         session1IsCarryover: true,
-        intervalStartMs: realStartMs, intervalEndMs: endMs,
+        intervals,
       }
     }
     return {
       correctedHours: null, isAutoClose: false, isEnCurso: true, session1IsCarryover: true,
-      intervalStartMs: null, intervalEndMs: null,
+      intervals: [],
     }
   }
 
@@ -268,64 +278,79 @@ export function computeCorrectedHours(
   // Common when employee is currently working (real APP session started).
   if (salida2 === null && entrada2 !== null) {
     if (progEndTime) {
-      // If session 1 was a non-real source (but not DAY_CHANGE handled above),
-      // start the calculation from session 2 to avoid including the overnight gap.
-      const calcFromMs = !isReal(entrada1.source)
-        ? new Date(entrada2.time).getTime()
-        : entry1Ms
       const endMs = toBADateTime(referenceDate, progEndTime)
+      // If session 1 was a non-real source (but not DAY_CHANGE handled above),
+      // ignore it entirely and count only session 2, to avoid including the
+      // overnight/artifact gap.
+      if (!isReal(entrada1.source)) {
+        const startMs = new Date(entrada2.time).getTime()
+        const intervals = [{ startMs, endMs }]
+        return {
+          correctedHours: sumIntervalsHours(intervals),
+          isAutoClose: true,
+          isEnCurso: isReal(entrada2.source),
+          session1IsCarryover: false,
+          intervals,
+        }
+      }
+      // Session 1 is real. If it was closed (salida1 exists), that's a break
+      // (e.g. lunch) — count session 1 and session 2 separately so the break
+      // in between is excluded.
+      const intervals: SessionInterval[] = salida1 !== null
+        ? [{ startMs: entry1Ms, endMs: new Date(salida1.time).getTime() }, { startMs: new Date(entrada2.time).getTime(), endMs }]
+        : [{ startMs: entry1Ms, endMs }]
       return {
-        correctedHours: Math.max(0, (endMs - calcFromMs) / 3_600_000),
+        correctedHours: sumIntervalsHours(intervals),
         isAutoClose: true,
         isEnCurso: isReal(entrada2.source),
         session1IsCarryover: false,
-        intervalStartMs: calcFromMs, intervalEndMs: endMs,
+        intervals,
       }
     }
     // No prog time — fall through to session 1 calculation
   }
 
   // ── Redash SQL cases ──────────────────────────────────────────────────────
+  // Both sessions closed. Count session 1 (entrada1→salida1) and session 2
+  // (entrada2→salida2) separately so the break between them (lunch, etc.) is
+  // never counted as worked time.
   if (salida2 !== null) {
-    if (isReal(salida2.source) || !progEndTime) {
-      const endMs = new Date(salida2.time).getTime()
-      return {
-        correctedHours: Math.max(0, (endMs - entry1Ms) / 3_600_000),
-        isAutoClose: !isReal(salida2.source),
-        isEnCurso: false,
-        session1IsCarryover: false,
-        intervalStartMs: entry1Ms, intervalEndMs: endMs,
-      }
-    }
-    const endMs = toBADateTime(referenceDate, progEndTime)
+    const usesSalida2Time = isReal(salida2.source) || !progEndTime
+    const endMs = usesSalida2Time ? new Date(salida2.time).getTime() : toBADateTime(referenceDate, progEndTime!)
+    const intervals: SessionInterval[] = [
+      { startMs: entry1Ms, endMs: new Date(salida1!.time).getTime() },
+      { startMs: new Date(entrada2!.time).getTime(), endMs },
+    ]
     return {
-      correctedHours: Math.max(0, (endMs - entry1Ms) / 3_600_000),
-      isAutoClose: true,
+      correctedHours: sumIntervalsHours(intervals),
+      isAutoClose: !usesSalida2Time || !isReal(salida2.source),
       isEnCurso: false,
       session1IsCarryover: false,
-      intervalStartMs: entry1Ms, intervalEndMs: endMs,
+      intervals,
     }
   }
 
   if (salida1 !== null) {
     const endMs = new Date(salida1.time).getTime()
+    const intervals = [{ startMs: entry1Ms, endMs }]
     return {
-      correctedHours: Math.max(0, (endMs - entry1Ms) / 3_600_000),
+      correctedHours: sumIntervalsHours(intervals),
       isAutoClose: !isReal(salida1.source),
       isEnCurso: false,
       session1IsCarryover: false,
-      intervalStartMs: entry1Ms, intervalEndMs: endMs,
+      intervals,
     }
   }
 
   if (progEndTime) {
     const endMs = toBADateTime(referenceDate, progEndTime)
+    const intervals = [{ startMs: entry1Ms, endMs }]
     return {
-      correctedHours: Math.max(0, (endMs - entry1Ms) / 3_600_000),
+      correctedHours: sumIntervalsHours(intervals),
       isAutoClose: true,
       isEnCurso: false,
       session1IsCarryover: false,
-      intervalStartMs: entry1Ms, intervalEndMs: endMs,
+      intervals,
     }
   }
 
@@ -360,8 +385,7 @@ const NIGHT_END = '06:00'
 const SATURDAY_100_AFTER_MS = 5 * 3_600_000
 
 export function computeHourBreakdown(
-  intervalStartMs: number | null,
-  intervalEndMs: number | null,
+  intervals: SessionInterval[],
   scheduledStart: string | null,
   scheduledEnd: string | null,
   hasSchedule: boolean,
@@ -369,9 +393,10 @@ export function computeHourBreakdown(
   isHoliday: boolean
 ): HourBreakdown {
   const zero = { normalHours: 0, extra50Hours: 0, extra100Hours: 0, nightHours: 0 }
-  if (intervalStartMs === null || intervalEndMs === null || intervalEndMs <= intervalStartMs) return zero
+  const validIntervals = intervals.filter((iv) => iv.endMs > iv.startMs).sort((a, b) => a.startMs - b.startMs)
+  if (validIntervals.length === 0) return zero
 
-  // Night windows (21:00–06:00) for the days spanning the interval, in case of
+  // Night windows (21:00–06:00) for the days spanning the intervals, in case of
   // an overnight shift.
   const nightWindows = [-1, 0, 1].map((n) => {
     const d = addDaysToDateStr(referenceDate, n)
@@ -389,67 +414,71 @@ export function computeHourBreakdown(
     if (winEndMs <= winStartMs) winEndMs += 24 * 3_600_000
   }
 
-  // Breakpoints: night window edges + scheduled window edges, clipped to the interval.
-  const breakpoints = new Set<number>([intervalStartMs, intervalEndMs])
-  for (const w of nightWindows) {
-    if (w.start > intervalStartMs && w.start < intervalEndMs) breakpoints.add(w.start)
-    if (w.end > intervalStartMs && w.end < intervalEndMs) breakpoints.add(w.end)
-  }
-  if (winStartMs !== null && winEndMs !== null) {
-    if (winStartMs > intervalStartMs && winStartMs < intervalEndMs) breakpoints.add(winStartMs)
-    if (winEndMs > intervalStartMs && winEndMs < intervalEndMs) breakpoints.add(winEndMs)
-  }
-
-  const points = [...breakpoints].sort((a, b) => a - b)
-
   let normalMs = 0, extra50Ms = 0, extra100Ms = 0, nightMs = 0
-  let consumedSaturdayMs = 0 // cumulative non-night Saturday hours worked, across segments
+  // Cumulative non-night Saturday hours worked, across all sessions of the day
+  // (so the 5h threshold applies to the whole day, not per session).
+  let consumedSaturdayMs = 0
 
-  for (let i = 0; i < points.length - 1; i++) {
-    const segStart = points[i]
-    const segEnd = points[i + 1]
-    const dur = segEnd - segStart
-    if (dur <= 0) continue
-    const mid = (segStart + segEnd) / 2
-
-    const isNight = nightWindows.some((w) => mid >= w.start && mid < w.end)
-    if (isNight) {
-      nightMs += dur
-      continue
+  for (const { startMs: intervalStartMs, endMs: intervalEndMs } of validIntervals) {
+    // Breakpoints: night window edges + scheduled window edges, clipped to the interval.
+    const breakpoints = new Set<number>([intervalStartMs, intervalEndMs])
+    for (const w of nightWindows) {
+      if (w.start > intervalStartMs && w.start < intervalEndMs) breakpoints.add(w.start)
+      if (w.end > intervalStartMs && w.end < intervalEndMs) breakpoints.add(w.end)
+    }
+    if (winStartMs !== null && winEndMs !== null) {
+      if (winStartMs > intervalStartMs && winStartMs < intervalEndMs) breakpoints.add(winStartMs)
+      if (winEndMs > intervalStartMs && winEndMs < intervalEndMs) breakpoints.add(winEndMs)
     }
 
-    const baMid = new Date(mid - 3 * 3_600_000)
-    const segDate = baMid.toISOString().split('T')[0]
-    const segWeekday = weekdayOf(segDate)
+    const points = [...breakpoints].sort((a, b) => a - b)
 
-    if (isHoliday || segWeekday === 'SUNDAY') {
-      extra100Ms += dur
-      continue
-    }
+    for (let i = 0; i < points.length - 1; i++) {
+      const segStart = points[i]
+      const segEnd = points[i + 1]
+      const dur = segEnd - segStart
+      if (dur <= 0) continue
+      const mid = (segStart + segEnd) / 2
 
-    if (segWeekday === 'SATURDAY') {
-      const remaining = SATURDAY_100_AFTER_MS - consumedSaturdayMs
-      if (remaining <= 0) {
-        extra100Ms += dur
-      } else if (dur <= remaining) {
-        normalMs += dur
-        consumedSaturdayMs += dur
-      } else {
-        normalMs += remaining
-        extra100Ms += dur - remaining
-        consumedSaturdayMs += remaining
+      const isNight = nightWindows.some((w) => mid >= w.start && mid < w.end)
+      if (isNight) {
+        nightMs += dur
+        continue
       }
-      continue
-    }
 
-    // Weekday (Mon–Fri).
-    if (winStartMs === null || winEndMs === null) {
-      // No schedule → don't infer extras, everything worked is "normal".
-      normalMs += dur
-      continue
+      const baMid = new Date(mid - 3 * 3_600_000)
+      const segDate = baMid.toISOString().split('T')[0]
+      const segWeekday = weekdayOf(segDate)
+
+      if (isHoliday || segWeekday === 'SUNDAY') {
+        extra100Ms += dur
+        continue
+      }
+
+      if (segWeekday === 'SATURDAY') {
+        const remaining = SATURDAY_100_AFTER_MS - consumedSaturdayMs
+        if (remaining <= 0) {
+          extra100Ms += dur
+        } else if (dur <= remaining) {
+          normalMs += dur
+          consumedSaturdayMs += dur
+        } else {
+          normalMs += remaining
+          extra100Ms += dur - remaining
+          consumedSaturdayMs += remaining
+        }
+        continue
+      }
+
+      // Weekday (Mon–Fri).
+      if (winStartMs === null || winEndMs === null) {
+        // No schedule → don't infer extras, everything worked is "normal".
+        normalMs += dur
+        continue
+      }
+      const inWindow = segDate === referenceDate && mid >= winStartMs && mid < winEndMs
+      if (inWindow) normalMs += dur; else extra50Ms += dur
     }
-    const inWindow = segDate === referenceDate && mid >= winStartMs && mid < winEndMs
-    if (inWindow) normalMs += dur; else extra50Ms += dur
   }
 
   return {
@@ -541,7 +570,7 @@ export function buildMatrixData(
         continue
       }
 
-      const { correctedHours, isAutoClose, isEnCurso, session1IsCarryover, intervalStartMs, intervalEndMs } =
+      const { correctedHours, isAutoClose, isEnCurso, session1IsCarryover, intervals } =
         computeCorrectedHours(summary.entries, summary.timeSlots, date)
 
       const status = getDayStatus(summary, isAutoClose, isEnCurso)
@@ -554,7 +583,7 @@ export function buildMatrixData(
       }, 0)
 
       const { normalHours, extra50Hours, extra100Hours, nightHours } = computeHourBreakdown(
-        intervalStartMs, intervalEndMs, scheduledStart, scheduledEnd, summary.hasSchedule, date,
+        intervals, scheduledStart, scheduledEnd, summary.hasSchedule, date,
         summary.holidays.length > 0
       )
 

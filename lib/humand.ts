@@ -188,6 +188,23 @@ function weekdayOf(date: string): string {
 // Hours calculation — mirrors Redash SQL logic + improvements for edge cases
 // ─────────────────────────────────────────────────────────────────────────────
 
+export function sortSlotsByStart(timeSlots: HumandTimeSlot[] | null): HumandTimeSlot[] {
+  return [...(timeSlots ?? [])].sort((a, b) => a.startTime.localeCompare(b.startTime) || a.id - b.id)
+}
+
+function scheduledEndMsFor(slots: HumandTimeSlot[], date: string, fromMs: number): number | null {
+  if (slots.length === 0) return null
+  let lastEnd = 0
+  for (const s of slots) {
+    const startMs = toBADateTime(date, s.startTime)
+    let endMs = toBADateTime(date, s.endTime)
+    if (endMs <= startMs) endMs += 24 * 3_600_000
+    lastEnd = endMs
+    if (endMs > fromMs) return endMs
+  }
+  return lastEnd
+}
+
 export interface SessionInterval {
   startMs: number
   endMs: number
@@ -226,8 +243,10 @@ export function computeCorrectedHours(
   const salida2 = ends.length > 1 ? ends[1] : null
 
   // Scheduled end time = first slot by ID (mirrors Redash DISTINCT ON ORDER BY ts.id)
-  const slots = (timeSlots ?? []).sort((a, b) => a.id - b.id)
-  const progEndTime = slots.length > 0 ? slots[0].endTime : null
+  const slots = sortSlotsByStart(timeSlots)
+  // Scheduled end of the slot that covers the open session (so a split shift
+  // in its afternoon block is estimated to the afternoon end, not the morning one).
+  const progEndMs = (fromMs: number): number | null => scheduledEndMsFor(slots, referenceDate, fromMs)
 
   const isReal = (src: string | null) => src !== null && REAL_SOURCES.has(src.split(' ')[0])
 
@@ -254,8 +273,9 @@ export function computeCorrectedHours(
       }
     }
     // Session 2 is open → en curso, estimate to scheduled end
-    if (progEndTime) {
-      const endMs = toBADateTime(referenceDate, progEndTime)
+    const carryEndMs = progEndMs(realStartMs)
+    if (carryEndMs !== null) {
+      const endMs = carryEndMs
       const intervals = [{ startMs: realStartMs, endMs }]
       return {
         correctedHours: sumIntervalsHours(intervals),
@@ -277,8 +297,9 @@ export function computeCorrectedHours(
   // New case beyond Redash SQL: session 2 started but no exit yet.
   // Common when employee is currently working (real APP session started).
   if (salida2 === null && entrada2 !== null) {
-    if (progEndTime) {
-      const endMs = toBADateTime(referenceDate, progEndTime)
+    const open2EndMs = progEndMs(new Date(entrada2.time).getTime())
+    if (open2EndMs !== null) {
+      const endMs = open2EndMs
       // If session 1 was a non-real source (but not DAY_CHANGE handled above),
       // ignore it entirely and count only session 2, to avoid including the
       // overnight/artifact gap.
@@ -315,8 +336,9 @@ export function computeCorrectedHours(
   // (entrada2→salida2) separately so the break between them (lunch, etc.) is
   // never counted as worked time.
   if (salida2 !== null) {
-    const usesSalida2Time = isReal(salida2.source) || !progEndTime
-    const endMs = usesSalida2Time ? new Date(salida2.time).getTime() : toBADateTime(referenceDate, progEndTime!)
+    const schedEndMs = progEndMs(new Date(entrada2!.time).getTime())
+    const usesSalida2Time = isReal(salida2.source) || schedEndMs === null
+    const endMs = usesSalida2Time ? new Date(salida2.time).getTime() : schedEndMs!
     const intervals: SessionInterval[] = [
       { startMs: entry1Ms, endMs: new Date(salida1!.time).getTime() },
       { startMs: new Date(entrada2!.time).getTime(), endMs },
@@ -342,8 +364,9 @@ export function computeCorrectedHours(
     }
   }
 
-  if (progEndTime) {
-    const endMs = toBADateTime(referenceDate, progEndTime)
+  const singleEndMs = progEndMs(entry1Ms)
+  if (singleEndMs !== null) {
+    const endMs = singleEndMs
     const intervals = [{ startMs: entry1Ms, endMs }]
     return {
       correctedHours: sumIntervalsHours(intervals),
@@ -575,7 +598,7 @@ export function buildMatrixData(
 
       const status = getDayStatus(summary, isAutoClose, isEnCurso)
 
-      const slots = (summary.timeSlots ?? []).sort((a, b) => a.id - b.id)
+      const slots = sortSlotsByStart(summary.timeSlots)
       const scheduledStart = slots.length > 0 ? slots[0].startTime : null
       const scheduledEnd = slots.length > 0 ? slots[slots.length - 1].endTime : null
       const scheduledHours = slots.reduce((sum, s) => {

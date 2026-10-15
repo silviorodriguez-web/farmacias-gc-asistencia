@@ -3,6 +3,7 @@ import {
   fetchAllEmployees,
   fetchAllDaySummaries,
   computeCorrectedHours,
+  sortSlotsByStart,
   HumandDaySummary,
   HumandEmployee,
 } from '@/lib/humand'
@@ -37,7 +38,7 @@ function buildRow(
   summary: HumandDaySummary,
   emp: HumandEmployee | undefined
 ): AttendanceRow {
-  const slots = (summary.timeSlots ?? []).sort((a, b) => a.id - b.id)
+  const slots = sortSlotsByStart(summary.timeSlots)
   const scheduledStart = slots.length > 0 ? slots[0].startTime : null
   const scheduledEnd = slots.length > 0 ? slots[slots.length - 1].endTime : null
 

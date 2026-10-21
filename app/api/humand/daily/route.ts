@@ -38,7 +38,7 @@ function buildRow(
   summary: HumandDaySummary,
   emp: HumandEmployee | undefined
 ): AttendanceRow {
-  const slots = sortSlotsByStart(summary.timeSlots)
+  const slots = sortSlotsByStart(summary.timeSlots, summary.referenceDate)
   const scheduledStart = slots.length > 0 ? slots[0].startTime : null
   const scheduledEnd = slots.length > 0 ? slots[slots.length - 1].endTime : null
 

@@ -412,7 +412,7 @@ function exportMatrixToExcel(matrixData: MatrixData, dates: string[]) {
   // + 4 period-total columns per type + the pre-existing overall totals.
   const header = [
     'Colaborador', 'Sucursal', 'Puesto',
-    'Hs. Trab.', 'Hs. Prog.', '%', 'Presentes', 'Ausentes', 'Auto-cierres',
+    'Hs. Neto', 'Hs. Prog.', '%', 'Presentes', 'Ausentes', 'Auto-cierres',
     ...dates.flatMap((d) => {
       const [, mo, day] = d.split('-')
       const emp0 = matrixData.employees[0]
@@ -421,7 +421,7 @@ function exportMatrixToExcel(matrixData: MatrixData, dates: string[]) {
       return [`${label} Normal`, `${label} Ext.50%`, `${label} Ext.100%`, `${label} Noct.`]
     }),
     'Total Normal', 'Total Ext.50%', 'Total Ext.100%', 'Total Noct.',
-    'Total Hs.', 'Prog. Hs.', '% Total',
+    'Total Neto', 'Prog. Hs.', '% Total',
   ]
 
   const rows: (string | number)[][] = [header]

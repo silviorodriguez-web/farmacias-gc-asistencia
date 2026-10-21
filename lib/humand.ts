@@ -188,8 +188,35 @@ function weekdayOf(date: string): string {
 // Hours calculation — mirrors Redash SQL logic + improvements for edge cases
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function sortSlotsByStart(timeSlots: HumandTimeSlot[] | null): HumandTimeSlot[] {
-  return [...(timeSlots ?? [])].sort((a, b) => a.startTime.localeCompare(b.startTime) || a.id - b.id)
+function slotRangeMs(sl: HumandTimeSlot, date: string): [number, number] {
+  const start = toBADateTime(date, sl.startTime)
+  let end = toBADateTime(date, sl.endTime)
+  if (end <= start) end += 24 * 3_600_000
+  return [start, end]
+}
+
+// A shift change ("Cambio Horario") replaces the scheduled shift for that day:
+// when slots overlap, only the newest one (highest id) is kept. Non-overlapping
+// slots (split shifts) are all kept. Result is sorted by start time.
+export function sortSlotsByStart(timeSlots: HumandTimeSlot[] | null, date: string): HumandTimeSlot[] {
+  const byNewest = [...(timeSlots ?? [])].sort((a, b) => b.id - a.id)
+  const kept: HumandTimeSlot[] = []
+  for (const sl of byNewest) {
+    const [st, en] = slotRangeMs(sl, date)
+    const overlaps = kept.some((k) => {
+      const [kst, ken] = slotRangeMs(k, date)
+      return st < ken && kst < en
+    })
+    if (!overlaps) kept.push(sl)
+  }
+  return kept.sort((a, b) => slotRangeMs(a, date)[0] - slotRangeMs(b, date)[0])
+}
+
+export function scheduledTotalMs(slots: HumandTimeSlot[], date: string): number {
+  return slots.reduce((sum, sl) => {
+    const [st, en] = slotRangeMs(sl, date)
+    return sum + (en - st)
+  }, 0)
 }
 
 function scheduledEndMsFor(slots: HumandTimeSlot[], date: string, fromMs: number): number | null {
@@ -243,7 +270,7 @@ export function computeCorrectedHours(
   const salida2 = ends.length > 1 ? ends[1] : null
 
   // Scheduled end time = first slot by ID (mirrors Redash DISTINCT ON ORDER BY ts.id)
-  const slots = sortSlotsByStart(timeSlots)
+  const slots = sortSlotsByStart(timeSlots, referenceDate)
   // Scheduled end of the slot that covers the open session (so a split shift
   // in its afternoon block is estimated to the afternoon end, not the morning one).
   const progEndMs = (fromMs: number): number | null => scheduledEndMsFor(slots, referenceDate, fromMs)
@@ -384,11 +411,12 @@ export function computeCorrectedHours(
 // Hour type breakdown — normal / extra 50% / extra 100% / nocturnas
 //
 // Rules (confirmed with client, 2026-09-11 correction from Paula Ferro):
-//  - Normal: hours worked within the day's scheduled window (start–end of the
-//    day's time slots). If the day has no schedule at all, everything worked
-//    is "normal" (no extras are inferred) — flag for manual payroll review.
-//  - Extra 50%: hours worked on a weekday (Mon–Fri) outside the scheduled
-//    window, up to 21:00 (hours from 21:00 on are pulled into "nocturnas").
+//  - Normal: hours worked on a weekday (Mon–Fri) up to the day's scheduled
+//    hours (sum of the day's time slots), regardless of when they were worked.
+//    If the day has no schedule at all, everything worked is "normal" (no
+//    extras are inferred) — flag for manual payroll review.
+//  - Extra 50%: hours worked on a weekday beyond the day's scheduled hours,
+//    up to 21:00 (hours from 21:00 on are pulled into "nocturnas").
 //  - Extra 100%: hours worked on a Saturday beyond the first 5 hours worked
 //    that day (cumulative, regardless of schedule/time of day), OR any hour
 //    worked on a Sunday or holiday (the whole day, regardless of schedule).
@@ -409,9 +437,7 @@ const SATURDAY_100_AFTER_MS = 5 * 3_600_000
 
 export function computeHourBreakdown(
   intervals: SessionInterval[],
-  scheduledStart: string | null,
-  scheduledEnd: string | null,
-  hasSchedule: boolean,
+  scheduledMs: number | null,
   referenceDate: string,
   isHoliday: boolean
 ): HourBreakdown {
@@ -427,31 +453,19 @@ export function computeHourBreakdown(
     return { start: toBADateTime(d, NIGHT_START), end: toBADateTime(nd, NIGHT_END) }
   })
 
-  // Scheduled window for referenceDate (used to tell "normal" from "extra" on
-  // weekdays). Handles an overnight schedule (end time before start time).
-  let winStartMs: number | null = null
-  let winEndMs: number | null = null
-  if (hasSchedule && scheduledStart && scheduledEnd) {
-    winStartMs = toBADateTime(referenceDate, scheduledStart)
-    winEndMs = toBADateTime(referenceDate, scheduledEnd)
-    if (winEndMs <= winStartMs) winEndMs += 24 * 3_600_000
-  }
-
   let normalMs = 0, extra50Ms = 0, extra100Ms = 0, nightMs = 0
   // Cumulative non-night Saturday hours worked, across all sessions of the day
   // (so the 5h threshold applies to the whole day, not per session).
   let consumedSaturdayMs = 0
+  // Cumulative non-night weekday hours worked, to tell "normal" from "extra 50%".
+  let consumedWeekdayMs = 0
 
   for (const { startMs: intervalStartMs, endMs: intervalEndMs } of validIntervals) {
-    // Breakpoints: night window edges + scheduled window edges, clipped to the interval.
+    // Breakpoints: night window edges, clipped to the interval.
     const breakpoints = new Set<number>([intervalStartMs, intervalEndMs])
     for (const w of nightWindows) {
       if (w.start > intervalStartMs && w.start < intervalEndMs) breakpoints.add(w.start)
       if (w.end > intervalStartMs && w.end < intervalEndMs) breakpoints.add(w.end)
-    }
-    if (winStartMs !== null && winEndMs !== null) {
-      if (winStartMs > intervalStartMs && winStartMs < intervalEndMs) breakpoints.add(winStartMs)
-      if (winEndMs > intervalStartMs && winEndMs < intervalEndMs) breakpoints.add(winEndMs)
     }
 
     const points = [...breakpoints].sort((a, b) => a - b)
@@ -494,13 +508,22 @@ export function computeHourBreakdown(
       }
 
       // Weekday (Mon–Fri).
-      if (winStartMs === null || winEndMs === null) {
+      if (scheduledMs === null) {
         // No schedule → don't infer extras, everything worked is "normal".
         normalMs += dur
         continue
       }
-      const inWindow = segDate === referenceDate && mid >= winStartMs && mid < winEndMs
-      if (inWindow) normalMs += dur; else extra50Ms += dur
+      const remaining = scheduledMs - consumedWeekdayMs
+      if (remaining <= 0) {
+        extra50Ms += dur
+      } else if (dur <= remaining) {
+        normalMs += dur
+        consumedWeekdayMs += dur
+      } else {
+        normalMs += remaining
+        extra50Ms += dur - remaining
+        consumedWeekdayMs += remaining
+      }
     }
   }
 
@@ -598,15 +621,14 @@ export function buildMatrixData(
 
       const status = getDayStatus(summary, isAutoClose, isEnCurso)
 
-      const slots = sortSlotsByStart(summary.timeSlots)
+      const slots = sortSlotsByStart(summary.timeSlots, date)
       const scheduledStart = slots.length > 0 ? slots[0].startTime : null
       const scheduledEnd = slots.length > 0 ? slots[slots.length - 1].endTime : null
-      const scheduledHours = slots.reduce((sum, s) => {
-        return sum + (toBADateTime(date, s.endTime) - toBADateTime(date, s.startTime)) / 3_600_000
-      }, 0)
+      const scheduledMs = scheduledTotalMs(slots, date)
+      const scheduledHours = scheduledMs / 3_600_000
 
       const { normalHours, extra50Hours, extra100Hours, nightHours } = computeHourBreakdown(
-        intervals, scheduledStart, scheduledEnd, summary.hasSchedule, date,
+        intervals, summary.hasSchedule && scheduledMs > 0 ? scheduledMs : null, date,
         summary.holidays.length > 0
       )
 

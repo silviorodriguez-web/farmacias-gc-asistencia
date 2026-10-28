@@ -318,7 +318,7 @@ function BranchSection({ branch, employees, dates }: {
       </tr>
 
       {!collapsed && employees.map((emp) => (
-        <tr key={emp.employeeId} className="hover:bg-gray-50 border-b border-gray-100">
+        <tr key={`${emp.employeeId}-${emp.location}`} className="hover:bg-gray-50 border-b border-gray-100">
           <td className="sticky left-0 bg-white z-10 border-r border-gray-200 px-3 py-1 min-w-44">
             <div className="text-xs font-semibold text-gray-800 truncate max-w-40">
               {emp.name}

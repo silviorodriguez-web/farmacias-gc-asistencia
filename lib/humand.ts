@@ -580,39 +580,41 @@ export function buildMatrixData(
 
   const activeIds = [...new Set(summaries.map((s) => s.employeeId))]
 
-  const matrixEmployees: MatrixEmployee[] = activeIds.map((eid) => {
+  const emptyDay = (): MatrixDay => ({
+    status: 'dayoff', correctedHours: null, rawHours: 0,
+    normalHours: 0, extra50Hours: 0, extra100Hours: 0, nightHours: 0,
+    isAutoClose: false, isEnCurso: false,
+    holidayName: null, timeOffName: null,
+    weekday: '', isWorkday: false, hasSchedule: false,
+    scheduledStart: null, scheduledEnd: null,
+    entry1: null, exit1: null, entry2: null, exit2: null,
+    exit1Source: null, exit2Source: null, entry1Source: null, entry2Source: null,
+    sites: [], incidences: [],
+  })
+
+  const normSite = (s: string) => s.trim().toLowerCase()
+  const sameSite = (a: string, b: string) => {
+    const x = normSite(a), y = normSite(b)
+    return x === y || x.includes(y) || y.includes(x)
+  }
+
+  const matrixEmployees: MatrixEmployee[] = activeIds.flatMap((eid) => {
     const emp = empMap[eid]
     const segs: Record<string, string> = {}
     for (const s of emp?.segmentations ?? []) segs[s.group] = s.item
+    // An employee can have several "Ubicación" items (works in more than one branch).
+    const locations = [...new Set(
+      (emp?.segmentations ?? []).filter((s) => s.group === 'Ubicación').map((s) => s.item)
+    )]
+    if (locations.length === 0) locations.push('Sin sucursal')
 
     const days: Record<string, MatrixDay> = {}
-    let totalCorrectedHours = 0
-    let totalScheduledHours = 0
-    let totalNormalHours = 0
-    let totalExtra50Hours = 0
-    let totalExtra100Hours = 0
-    let totalNightHours = 0
-    let daysPresent = 0
-    let daysAbsent = 0
-    let autoCloseDays = 0
-    let holidayDays = 0
-    let timeOffDays = 0
-    let enCursoDays = 0
+    const scheduledByDate: Record<string, number> = {}
 
     for (const date of dates) {
       const summary = idx[`${eid}_${date}`]
       if (!summary) {
-        days[date] = {
-          status: 'dayoff', correctedHours: null, rawHours: 0,
-          normalHours: 0, extra50Hours: 0, extra100Hours: 0, nightHours: 0,
-          isAutoClose: false, isEnCurso: false,
-          holidayName: null, timeOffName: null,
-          weekday: '', isWorkday: false, hasSchedule: false,
-          scheduledStart: null, scheduledEnd: null,
-          entry1: null, exit1: null, entry2: null, exit2: null,
-          exit1Source: null, exit2Source: null, entry1Source: null, entry2Source: null,
-          sites: [], incidences: [],
-        }
+        days[date] = emptyDay()
         continue
       }
 
@@ -668,44 +670,78 @@ export function buildMatrixData(
         incidences: summary.incidences,
       }
 
-      if (correctedHours !== null) totalCorrectedHours += correctedHours
-      totalScheduledHours += scheduledHours
-      totalNormalHours += normalHours
-      totalExtra50Hours += extra50Hours
-      totalExtra100Hours += extra100Hours
-      totalNightHours += nightHours
-      if (status === 'present' || status === 'autoclose' || status === 'encurso') daysPresent++
-      if (status === 'absent') daysAbsent++
-      if (isAutoClose) autoCloseDays++
-      if (status === 'holiday') holidayDays++
-      if (status === 'timeoff') timeOffDays++
-      if (isEnCurso) enCursoDays++
+      scheduledByDate[date] = scheduledHours
     }
 
     const name = emp ? `${emp.firstName} ${emp.lastName}` : eid
 
-    return {
-      employeeId: eid,
-      name,
-      location: segs['Ubicación'] ?? 'Sin sucursal',
-      area: segs['Área'] ?? '',
-      puesto: segs['Puesto'] ?? '',
-      days,
-      totals: {
-        correctedHours: totalCorrectedHours,
-        scheduledHours: totalScheduledHours,
-        normalHours: totalNormalHours,
-        extra50Hours: totalExtra50Hours,
-        extra100Hours: totalExtra100Hours,
-        nightHours: totalNightHours,
-        daysPresent,
-        daysAbsent,
-        autoCloseDays,
-        holidayDays,
-        timeOffDays,
-        enCursoDays,
-      },
+    // Each day belongs to the branch where the employee clocked in; days with no
+    // matching clock-in site (absences, days off) go to the first listed branch.
+    const dayLocation = (date: string): string => {
+      if (locations.length === 1) return locations[0]
+      const sites = days[date].sites
+      return locations.find((l) => sites.some((s) => sameSite(s, l))) ?? locations[0]
     }
+
+    return locations.map((location): MatrixEmployee => {
+      const ownDays: Record<string, MatrixDay> = {}
+      let totalCorrectedHours = 0
+      let totalScheduledHours = 0
+      let totalNormalHours = 0
+      let totalExtra50Hours = 0
+      let totalExtra100Hours = 0
+      let totalNightHours = 0
+      let daysPresent = 0
+      let daysAbsent = 0
+      let autoCloseDays = 0
+      let holidayDays = 0
+      let timeOffDays = 0
+      let enCursoDays = 0
+
+      for (const date of dates) {
+        const day = days[date]
+        if (dayLocation(date) !== location) {
+          ownDays[date] = emptyDay()
+          continue
+        }
+        ownDays[date] = day
+        if (day.correctedHours !== null) totalCorrectedHours += day.correctedHours
+        totalScheduledHours += scheduledByDate[date] ?? 0
+        totalNormalHours += day.normalHours
+        totalExtra50Hours += day.extra50Hours
+        totalExtra100Hours += day.extra100Hours
+        totalNightHours += day.nightHours
+        if (day.status === 'present' || day.status === 'autoclose' || day.status === 'encurso') daysPresent++
+        if (day.status === 'absent') daysAbsent++
+        if (day.isAutoClose) autoCloseDays++
+        if (day.status === 'holiday') holidayDays++
+        if (day.status === 'timeoff') timeOffDays++
+        if (day.isEnCurso) enCursoDays++
+      }
+
+      return {
+        employeeId: eid,
+        name,
+        location,
+        area: segs['Área'] ?? '',
+        puesto: segs['Puesto'] ?? '',
+        days: ownDays,
+        totals: {
+          correctedHours: totalCorrectedHours,
+          scheduledHours: totalScheduledHours,
+          normalHours: totalNormalHours,
+          extra50Hours: totalExtra50Hours,
+          extra100Hours: totalExtra100Hours,
+          nightHours: totalNightHours,
+          daysPresent,
+          daysAbsent,
+          autoCloseDays,
+          holidayDays,
+          timeOffDays,
+          enCursoDays,
+        },
+      }
+    })
   })
 
   matrixEmployees.sort((a, b) => {

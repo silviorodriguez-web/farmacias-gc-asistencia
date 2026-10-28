@@ -363,13 +363,17 @@ export function computeCorrectedHours(
   // (entrada2→salida2) separately so the break between them (lunch, etc.) is
   // never counted as worked time.
   if (salida2 !== null) {
-    const schedEndMs = progEndMs(new Date(entrada2!.time).getTime())
+    // Two exits but a single entry (stray/duplicate END): one session, entry1 → last exit.
+    const sessionStartMs = new Date((entrada2 ?? entrada1).time).getTime()
+    const schedEndMs = progEndMs(sessionStartMs)
     const usesSalida2Time = isReal(salida2.source) || schedEndMs === null
     const endMs = usesSalida2Time ? new Date(salida2.time).getTime() : schedEndMs!
-    const intervals: SessionInterval[] = [
-      { startMs: entry1Ms, endMs: new Date(salida1!.time).getTime() },
-      { startMs: new Date(entrada2!.time).getTime(), endMs },
-    ]
+    const intervals: SessionInterval[] = entrada2 === null
+      ? [{ startMs: entry1Ms, endMs }]
+      : [
+          { startMs: entry1Ms, endMs: new Date(salida1!.time).getTime() },
+          { startMs: sessionStartMs, endMs },
+        ]
     return {
       correctedHours: sumIntervalsHours(intervals),
       isAutoClose: !usesSalida2Time || !isReal(salida2.source),

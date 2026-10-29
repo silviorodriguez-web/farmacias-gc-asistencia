@@ -273,7 +273,12 @@ export function computeCorrectedHours(
   const slots = sortSlotsByStart(timeSlots, referenceDate)
   // Scheduled end of the slot that covers the open session (so a split shift
   // in its afternoon block is estimated to the afternoon end, not the morning one).
-  const progEndMs = (fromMs: number): number | null => scheduledEndMsFor(slots, referenceDate, fromMs)
+  // Estimated closes never go past "now": a session still open today can't have
+  // worked hours that haven't happened yet (past days keep the scheduled-end estimate).
+  const progEndMs = (fromMs: number): number | null => {
+    const end = scheduledEndMsFor(slots, referenceDate, fromMs)
+    return end === null ? null : Math.min(end, Date.now())
+  }
 
   const isReal = (src: string | null) => src !== null && REAL_SOURCES.has(src.split(' ')[0])
 
